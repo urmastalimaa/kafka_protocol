@@ -106,10 +106,14 @@
                , req_timeout :: ?undef | timeout()
                , api_vsns    :: ?undef | kpro:vsn_ranges()
                , requests    :: ?undef | requests()
-               , backlog     :: false | queue:queue()
+               , backlog     :: queue:queue(backlog_entry())
                }).
 
 -type state() :: #state{}.
+
+%% A request that waits to go to the socket, or the marker of a SASL re-authentication.
+-type backlog_entry() :: sasl_authenticate
+                       | {send, {pid(), reference() | noreply}, kpro:req()}.
 
 %%%_* API ======================================================================
 
@@ -238,7 +242,7 @@ connect(Parent, Host, Port, Config) ->
                     , remote      = {Host, Port}
                     , config      = Config
                     , sock        = Sock
-                    , backlog     = false
+                    , backlog     = queue:new()
                     },
       init_connection(State, Config, Deadline);
     {error, Reason} ->
@@ -483,12 +487,9 @@ handle_msg({tcp_error, Sock, Reason}, #state{sock = Sock}, _) ->
   exit({shutdown, Reason});
 handle_msg({ssl_error, Sock, Reason}, #state{sock = Sock}, _) ->
   exit({shutdown, Reason});
-handle_msg({_From, {send, _}} = Msg, #state{backlog = false} = State, Debug) ->
-  State1 = send_request(Msg, State),
-  ?MODULE:loop(State1, Debug);
-handle_msg({_From, {send, _}} = Msg, #state{backlog = Q} = State, Debug) ->
-  %% Avoid sending new requests until in-flight requests have been resolved
-  State1 = State#state{backlog = queue:in(Msg, Q)},
+handle_msg({From, {send, Request}}, #state{backlog = Backlog, config = Config} = State, Debug) ->
+  Entry = backlog_entry(From, Request, Config),
+  State1 = maybe_flush_backlog(State#state{backlog = queue:in(Entry, Backlog)}),
   ?MODULE:loop(State1, Debug);
 handle_msg({From, get_api_vsns}, State, Debug) ->
   maybe_reply(From, {ok, State#state.api_vsns}),
@@ -503,8 +504,8 @@ handle_msg({From, stop}, #state{mod = Mod, sock = Sock}, _Debug) ->
   Mod:close(Sock),
   maybe_reply(From, ok),
   ok;
-handle_msg(sasl_authenticate, State, Debug) ->
-  State1 = prepend_to_backlog(State, sasl_authenticate),
+handle_msg(sasl_authenticate, #state{backlog = Backlog} = State, Debug) ->
+  State1 = State#state{backlog = queue:in_r(sasl_authenticate, Backlog)},
   State2 = maybe_flush_backlog(State1),
   ?MODULE:loop(State2, Debug);
 handle_msg(Msg, #state{} = State, Debug) ->
@@ -512,7 +513,7 @@ handle_msg(Msg, #state{} = State, Debug) ->
                           [?MODULE, self(), Msg]),
   ?MODULE:loop(State, Debug).
 
-send_request({From, {send, Request}},
+send_request({send, From, Request},
              #state{ client_id = ClientId
                      , mod       = Mod
                      , sock      = Sock
@@ -545,13 +546,9 @@ send_request({From, {send, Request}},
   end,
   State#state{requests = NewRequests}.
 
-prepend_to_backlog(#state{backlog = false} = State, Item) ->
-  State#state{backlog = queue:from_list([Item])};
-prepend_to_backlog(#state{backlog = Backlog} = State, Item) ->
-  State#state{backlog = queue:in_r(Item, Backlog)}.
+backlog_entry(From, Request, _Config) ->
+  {send, From, Request}.
 
-maybe_flush_backlog(#state{backlog = false} = State) ->
-  State;
 maybe_flush_backlog(#state{requests = Requests, backlog = Backlog} = State) ->
   case queue:out(Backlog) of
     {{value, sasl_authenticate}, RemainingBacklog} ->
@@ -563,11 +560,11 @@ maybe_flush_backlog(#state{requests = Requests, backlog = Backlog} = State) ->
         false ->
           State
       end;
-    {{value, {_From, {send, _}} = Msg}, RemainingBacklog} ->
-      NewState = send_request(Msg, State#state{backlog = RemainingBacklog}),
+    {{value, {send, _From, _Request} = Entry}, RemainingBacklog} ->
+      NewState = send_request(Entry, State#state{backlog = RemainingBacklog}),
       maybe_flush_backlog(NewState);
     {empty, _} ->
-      State#state{backlog = false}
+      State
   end.
 
 sasl_authenticate(#state{client_id = ClientId, mod = Mod, sock = Sock, remote = {Host, _Port}, api_vsns = Versions, config = Config} = State) ->
