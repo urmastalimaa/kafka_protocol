@@ -29,6 +29,8 @@
 -export([ produce/4
         , produce/5
         , produce/6
+        , produce_meta/1
+        , merge_produce/1
         ]).
 
 -export([ metadata/2
@@ -321,6 +323,45 @@ produce(Vsn, Topic, Partition, Batch, Opts, Ref) ->
            , ref = Ref
            , no_ack = RequiredAcks =:= 0
            }.
+
+%% @private Read the head that produce/6 encodes, or `false' for other requests.
+%% A transactional request with an empty transactional_id looks like a request that
+%% is not transactional, but Kafka refuses an empty transactional_id in InitProducerId.
+-spec produce_meta(req()) -> false | map().
+produce_meta(#kpro_req{api = produce, vsn = Vsn, msg = [Head | _]}) when is_binary(Head) ->
+  case Head of
+    _ when Vsn =< 2 -> produce_meta(0, Head);
+    %% A null transactional_id from make/3 has length -1 and does not match.
+    <<TxnIdLen:16/signed, _:TxnIdLen/binary, Rest/binary>> -> produce_meta(TxnIdLen, Rest);
+    _ -> false
+  end;
+produce_meta(_Req) ->
+  false.
+
+produce_meta(TxnIdLen, <<Acks:16/signed, Timeout:32/signed, 1:32, TopicLen:16,
+                         Topic:TopicLen/binary, 1:32, Partition:32/signed, Size:32>>) ->
+  #{mergeable => TxnIdLen =:= 0 andalso Acks =/= 0, acks => Acks, timeout => Timeout,
+    topic => Topic, partition => Partition, size => Size};
+produce_meta(_TxnIdLen, _Rest) ->
+  false.
+
+%% @private The requests must come from produce/6, and must have the same vsn, acks
+%% and timeout, and different partitions.
+-spec merge_produce([req()]) -> req().
+merge_produce([#kpro_req{vsn = Vsn} = First | _] = Reqs) ->
+  #{acks := Acks, timeout := Timeout} = produce_meta(First),
+  Topics =
+    lists:foldr(
+      fun(#kpro_req{msg = [_Head | Batch]} = Req, Acc) ->
+          #{topic := Topic, partition := Partition} = produce_meta(Req),
+          Data = #{partition => Partition, record_set => Batch},
+          kpro_lib:update_map(Topic, fun(L) -> [Data | L] end, [Data], Acc)
+      end, #{}, Reqs),
+  make(produce, Vsn, #{ transactional_id => ?kpro_null
+                      , acks => Acks
+                      , timeout => Timeout
+                      , topic_data => [#{topic => T, data => D} || {T, D} <- maps:to_list(Topics)]
+                      }).
 
 %% @doc Make `end_txn' request.
 -spec end_txn(txn_ctx(), commit | abort) -> req().

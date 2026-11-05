@@ -1,3 +1,8 @@
+* Unreleased
+  - Add connection config `merge_produce`, defaults to `false`. When `true`, the produce requests
+    that wait for an in-flight produce request go as one request.
+    Limits: `merge_produce_max_bytes` (default 1048576) and `merge_produce_max_queue_bytes` (default 16777216).
+
 * 4.3.8
   - Restore concurrent in-flight requests after SASL reauthentication.
     Busy connections no longer wait for each queued response before sending the next request.

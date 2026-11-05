@@ -20,6 +20,7 @@
 
 -export([ get_topic/0
         , get_topic_lat/0
+        , get_topic_merge/0
         ]).
 
 -export([ sasl_config/0
@@ -84,6 +85,12 @@ get_topic() ->
 get_topic_lat() ->
   case osenv("KPRO_TEST_KAFKA_TOPIC_LAT_NAME") of
     undefined -> <<"test-topic-lat">>;
+    Str -> iolist_to_binary(Str)
+  end.
+
+get_topic_merge() ->
+  case osenv("KPRO_TEST_KAFKA_TOPIC_MERGE_NAME") of
+    undefined -> <<"test-topic-merge">>;
     Str -> iolist_to_binary(Str)
   end.
 

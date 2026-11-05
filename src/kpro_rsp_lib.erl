@@ -17,6 +17,7 @@
 
 -export([ decode/4
         , dec_struct/4
+        , split_produce/1
         ]).
 
 -include("kpro_private.hrl").
@@ -68,6 +69,16 @@ dec_struct([{Name, FieldSc} | Schema], Fields, Stack, Bin) ->
   {Value0, Rest} = dec_struct_field(FieldSc, NewStack, Bin),
   Value = translate(NewStack, Value0),
   dec_struct(Schema, Fields#{Name => Value}, Stack, Rest).
+
+%% @private
+-spec split_produce(kpro:rsp()) -> #{{kpro:topic(), kpro:partition()} => kpro:rsp()}.
+split_produce(#kpro_rsp{api = produce, msg = Msg} = Rsp) ->
+  maps:from_list(
+    [ {{kpro_lib:find(topic, TopicRsp), kpro_lib:find(partition, PartitionRsp)},
+       Rsp#kpro_rsp{msg = Msg#{responses => [TopicRsp#{partition_responses => [PartitionRsp]}]}}}
+      || TopicRsp <- kpro_lib:find(responses, Msg),
+         PartitionRsp <- kpro_lib:find(partition_responses, TopicRsp)
+    ]).
 
 %%%_* Internal functions =======================================================
 

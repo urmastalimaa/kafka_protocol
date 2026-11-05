@@ -89,6 +89,7 @@ function create_topic {
 
 create_topic "try-to-create-ignore-failure" || true
 create_topic "test-topic"
+create_topic "test-topic-merge" 4
 
 if [[ "$KAFKA_VERSION" != 0.9* ]]; then
   create_topic "test-topic-lat" 1 1 --config message.timestamp.type=LogAppendTime

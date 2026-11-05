@@ -51,11 +51,18 @@
 -define(DEFAULT_CONNECT_TIMEOUT, timer:seconds(5)).
 -define(DEFAULT_REQUEST_TIMEOUT, timer:minutes(4)).
 -define(SIZE_HEAD_BYTES, 4).
+%% Use the same as the reference client:
+%% https://kafka.apache.org/documentation/#producerconfigs_max.request.size
+-define(DEFAULT_MERGE_PRODUCE_MAX_BYTES, 1048576).
+-define(DEFAULT_MERGE_PRODUCE_MAX_QUEUE_BYTES, 16 * ?DEFAULT_MERGE_PRODUCE_MAX_BYTES).
 
 -type cfg_key() :: connect_timeout
                  | client_id
                  | extra_sock_opts
                  | debug
+                 | merge_produce
+                 | merge_produce_max_bytes
+                 | merge_produce_max_queue_bytes
                  | nolink
                  | query_api_versions
                  | request_timeout
@@ -76,6 +83,22 @@
 %%       is connected over IPv4 first, then over IPv6 if IPv4 fails.
 %%       Add `inet' to use IPv4 only, or `inet6' to use IPv6 only.</li>
 %%  <li>`debug': debugging mode, defaults to false</li>
+%%  <li>`merge_produce': whether to send the produce requests that wait for an in-flight
+%%       produce request as one request, defaults to false.
+%%       Only produce requests from `kpro_req_lib:produce/4,5,6' that are not
+%%       transactional and have `required_acks' 1 or -1 can merge.
+%%       For such a request, `kpro:request_async/2' returns `ok' before the request goes
+%%       to the socket, and the wait in the connection is not part of `request_timeout'.
+%%       The produce requests of a partition go to the socket in order. A request of
+%%       another API does not wait, thus it can go before a produce request that waits.
+%%       A caller of `kpro:send/2' gets no backpressure, thus it must limit its requests</li>
+%%  <li>`merge_produce_max_bytes': the maximum sum of the batch sizes in a merged
+%%       produce request, defaults to 1048576. It must be an integer, not `infinity'.
+%%       A larger batch goes alone in its request</li>
+%%  <li>`merge_produce_max_queue_bytes': the maximum sum of the batch sizes of the
+%%       produce requests that wait to merge, defaults to 16777216. Above it,
+%%       `kpro:request_async/2' returns `ok' only after the request goes to the socket.
+%%       `infinity' gives no limit</li>
 %%  <li>`nolink': whether not to link the `kpro_connection' process to the caller, defaults to false</li>
 %%  <li>`query_api_version': whether to query Kafka for supported API versions at the beginning,
 %%       so that `kpro' can use newer APIs; the `ApiVersionRequest' was introduced in Kafka 0.10,
@@ -107,13 +130,33 @@
                , api_vsns    :: ?undef | kpro:vsn_ranges()
                , requests    :: ?undef | requests()
                , backlog     :: queue:queue(backlog_entry())
+                 %% The sum of the batch sizes of the `merge' entries in `backlog'.
+               , merge_entry_bytes = 0 :: non_neg_integer()
+               , produce_in_flight = ?undef :: ?undef | {kpro:req_ref(), [in_flight_part()]}
                }).
 
 -type state() :: #state{}.
 
 %% A request that waits to go to the socket, or the marker of a SASL re-authentication.
 -type backlog_entry() :: sasl_authenticate
-                       | {send, {pid(), reference() | noreply}, kpro:req()}.
+                         %% It goes at once, unless the SASL marker is in front of it.
+                         %% For example, a metadata, fetch or offset_commit request. When
+                         %% `merge_produce' is `false', all requests are `send' entries.
+                       | {send, from(), kpro:req()}
+                         %% A produce request that cannot merge. It goes after the older
+                         %% entries of its partition. `all' (a request from make/3) goes
+                         %% after the older entries of all partitions.
+                       | {ordered, from(), kpro:req(), topic_partition() | all}
+                         %% A produce request that can go in one request with the others of
+                         %% the same merge key.
+                       | {merge, from(), kpro:req(), merge_key(), topic_partition(),
+                          Size :: non_neg_integer()}.
+
+-type from() :: {pid(), reference() | noreply}.
+-type topic_partition() :: {kpro:topic(), kpro:partition()}.
+-type merge_key() :: {kpro:vsn(), Acks :: integer(), Timeout :: integer()}.
+
+-type in_flight_part() :: {Caller :: pid(), kpro:req_ref(), topic_partition()}.
 
 %%%_* API ======================================================================
 
@@ -121,7 +164,8 @@
 -spec all_cfg_keys() -> [cfg_key()].
 all_cfg_keys() ->
   [ connect_timeout, debug, client_id, request_timeout, sasl, ssl,
-    nolink, query_api_versions, extra_sock_opts
+    nolink, query_api_versions, extra_sock_opts, merge_produce,
+    merge_produce_max_bytes, merge_produce_max_queue_bytes
   ].
 
 %% @doc Connect to the given endpoint.
@@ -466,9 +510,9 @@ handle_msg({_, Sock, Bin}, #state{ sock     = Sock
   {CorrId, Body} = kpro_lib:decode_corr_id(Bin),
   {Caller, Ref, API, Vsn} = kpro_sent_reqs:get_req(Requests, CorrId),
   Rsp = kpro_rsp_lib:decode(API, Vsn, Body, Ref),
-  ok = kafka_reply(Caller, {msg, self(), Rsp}),
+  State0 = deliver_rsp(Caller, Rsp, State),
   NewRequests = kpro_sent_reqs:del(Requests, CorrId),
-  State1 = maybe_flush_backlog(State#state{requests = NewRequests}),
+  State1 = flush_backlog(State0#state{requests = NewRequests}),
   ?MODULE:loop(State1, Debug);
 handle_msg(assert_max_req_age, #state{ requests = Requests
                                      , req_timeout = ReqTimeout
@@ -487,9 +531,9 @@ handle_msg({tcp_error, Sock, Reason}, #state{sock = Sock}, _) ->
   exit({shutdown, Reason});
 handle_msg({ssl_error, Sock, Reason}, #state{sock = Sock}, _) ->
   exit({shutdown, Reason});
-handle_msg({From, {send, Request}}, #state{backlog = Backlog, config = Config} = State, Debug) ->
+handle_msg({From, {send, Request}}, #state{config = Config} = State, Debug) ->
   Entry = backlog_entry(From, Request, Config),
-  State1 = maybe_flush_backlog(State#state{backlog = queue:in(Entry, Backlog)}),
+  State1 = maybe_flush_backlog(Entry, add_to_backlog(Entry, State)),
   ?MODULE:loop(State1, Debug);
 handle_msg({From, get_api_vsns}, State, Debug) ->
   maybe_reply(From, {ok, State#state.api_vsns}),
@@ -506,7 +550,7 @@ handle_msg({From, stop}, #state{mod = Mod, sock = Sock}, _Debug) ->
   ok;
 handle_msg(sasl_authenticate, #state{backlog = Backlog} = State, Debug) ->
   State1 = State#state{backlog = queue:in_r(sasl_authenticate, Backlog)},
-  State2 = maybe_flush_backlog(State1),
+  State2 = flush_backlog(State1),
   ?MODULE:loop(State2, Debug);
 handle_msg(Msg, #state{} = State, Debug) ->
   error_logger:warning_msg("[~p] ~p got unrecognized message: ~p",
@@ -546,26 +590,187 @@ send_request({send, From, Request},
   end,
   State#state{requests = NewRequests}.
 
+%% Merge of produce requests, when `merge_produce' is `true'.
+%%
+%% A broker reads the next request from a connection only after it has sent
+%% the response to the current request. A client such as brod sends one produce
+%% request per partition, thus each request waits for the requests in front of it:
+%%
+%%   without merge:  broker | p1 | p2 | p3 | p1 | p2 | p3 | ...
+%%                          0    W    2W   3W
+%%
+%%   with merge:     broker | p1 | p2 p3 | p1 p2 p3 | ...
+%%                          0    W       2W         3W
+%%
+%%   W: the time that the broker needs for one request.
+%%
+%% The produce requests that come while a produce request is in flight wait in
+%% the backlog, and go as one request when the response comes.
+backlog_entry(From, #kpro_req{api = produce, vsn = Vsn} = Request, #{merge_produce := true}) ->
+  case kpro_req_lib:produce_meta(Request) of
+    #{ mergeable := true
+     , acks := Acks
+     , timeout := Timeout
+     , topic := Topic
+     , partition := Partition
+     , size := Size
+     } ->
+      {merge, From, Request, {Vsn, Acks, Timeout}, {Topic, Partition}, Size};
+    #{topic := Topic, partition := Partition} ->
+      {ordered, From, Request, {Topic, Partition}};
+    false ->
+      {ordered, From, Request, all}
+  end;
 backlog_entry(From, Request, _Config) ->
   {send, From, Request}.
 
-maybe_flush_backlog(#state{requests = Requests, backlog = Backlog} = State) ->
-  case queue:out(Backlog) of
-    {{value, sasl_authenticate}, RemainingBacklog} ->
+%% While the backlog is in the limit, the caller of a `merge' entry gets `ok' at once
+%% and can send its next request. `noreply' stops a second `ok' at the socket write.
+%% Above the limit, the caller gets `ok' only at the socket write. This blocks the
+%% caller and thus limits the backlog.
+add_to_backlog({merge, {Caller, _} = From, Request, MergeKey, TopicPartition, Size},
+               #state{ backlog = Backlog
+                     , merge_entry_bytes = MergeEntryBytes
+                     , config = Config
+                     } = State) ->
+  MaxBytes = maps:get(merge_produce_max_queue_bytes, Config,
+                      ?DEFAULT_MERGE_PRODUCE_MAX_QUEUE_BYTES),
+  EntryFrom = case MergeEntryBytes + Size =< MaxBytes of
+                true -> ok = maybe_reply(From, ok), {Caller, noreply};
+                false -> From
+              end,
+  Entry = {merge, EntryFrom, Request, MergeKey, TopicPartition, Size},
+  State#state{backlog = queue:in(Entry, Backlog), merge_entry_bytes = MergeEntryBytes + Size};
+add_to_backlog(Entry, #state{backlog = Backlog} = State) ->
+  State#state{backlog = queue:in(Entry, Backlog)}.
+
+%% While a produce request is in flight, a new `merge' entry cannot go, and it does
+%% not make other entries free. A walk of the backlog for each new entry would cost
+%% the square of the number of entries.
+maybe_flush_backlog({merge, _, _, _, _, _}, #state{produce_in_flight = {_, _}} = State) ->
+  State;
+maybe_flush_backlog(_NewEntry, State) ->
+  flush_backlog(State).
+
+flush_backlog(#state{backlog = Backlog} = State) ->
+  flush_backlog(Backlog, #{}, queue:new(), State).
+
+%% PartitionsOnHold: an entry of a partition on hold cannot go in this walk, so that it
+%% does not go before an older entry. `all' puts all partitions on hold.
+flush_backlog(Backlog0, PartitionsOnHold, RemainingBacklogAcc,
+              #state{ requests = Requests
+                    , produce_in_flight = InFlight
+                    , config = Config
+                    } = State) ->
+  case queue:out(Backlog0) of
+    {{value, sasl_authenticate}, Backlog} ->
       %% Only authentication needs to wait for all in-flight responses.
       case kpro_sent_reqs:is_empty(Requests) of
         true ->
-          NewState = sasl_authenticate(State#state{backlog = RemainingBacklog}),
-          maybe_flush_backlog(NewState);
+          flush_backlog(Backlog, PartitionsOnHold, RemainingBacklogAcc,
+                        sasl_authenticate(State));
         false ->
-          State
+          State#state{backlog = queue:join(RemainingBacklogAcc, Backlog0)}
       end;
-    {{value, {send, _From, _Request} = Entry}, RemainingBacklog} ->
-      NewState = send_request(Entry, State#state{backlog = RemainingBacklog}),
-      maybe_flush_backlog(NewState);
+    {{value, {send, _From, _Request} = Entry}, Backlog} ->
+      flush_backlog(Backlog, PartitionsOnHold, RemainingBacklogAcc, send_request(Entry, State));
+    {{value, {ordered, From, Request, TopicPartition} = Entry}, Backlog} ->
+      case is_on_hold(TopicPartition, PartitionsOnHold) of
+        true ->
+          flush_backlog(Backlog, PartitionsOnHold#{TopicPartition => true},
+                        queue:in(Entry, RemainingBacklogAcc), State);
+        false ->
+          flush_backlog(Backlog, PartitionsOnHold, RemainingBacklogAcc,
+                        send_request({send, From, Request}, State))
+      end;
+    {{value, {merge, _, _, _, TopicPartition, _} = Entry}, Backlog} ->
+      case InFlight =:= ?undef andalso not is_on_hold(TopicPartition, PartitionsOnHold) of
+        true ->
+          MaxBytes = maps:get(merge_produce_max_bytes, Config, ?DEFAULT_MERGE_PRODUCE_MAX_BYTES),
+          {Parts, Rest} = take_produce_parts(Backlog0, PartitionsOnHold, MaxBytes),
+          flush_backlog(Rest, PartitionsOnHold, RemainingBacklogAcc,
+                        send_produce_parts(Parts, State));
+        false ->
+          flush_backlog(Backlog, PartitionsOnHold#{TopicPartition => true},
+                        queue:in(Entry, RemainingBacklogAcc), State)
+      end;
     {empty, _} ->
-      State
+      State#state{backlog = RemainingBacklogAcc}
   end.
+
+%% An entry with unknown partitions (`all') waits for every partition, and every
+%% partition waits for it.
+is_on_hold(all, PartitionsOnHold) ->
+  map_size(PartitionsOnHold) > 0;
+is_on_hold(TopicPartition, PartitionsOnHold) ->
+  is_map_key(TopicPartition, PartitionsOnHold) orelse is_map_key(all, PartitionsOnHold).
+
+take_produce_parts(Backlog0, PartitionsOnHold, MaxBytes) ->
+  {{value, {merge, _, _, MergeKey, TopicPartition, Size} = First}, Backlog} = queue:out(Backlog0),
+  take_produce_parts(Backlog, MergeKey, PartitionsOnHold#{TopicPartition => true},
+                     MaxBytes - Size, [First], queue:new()).
+
+take_produce_parts(Backlog0, MergeKey, PartitionsOnHold, BytesLeft, Taken, Rest) ->
+  case queue:out(Backlog0) of
+    {empty, _} ->
+      {lists:reverse(Taken), Rest};
+    %% The later entries of all partitions go after an entry with unknown partitions.
+    {{value, {ordered, _, _, all}}, _} ->
+      {lists:reverse(Taken), queue:join(Rest, Backlog0)};
+    {{value, {merge, _, _, PartKey, TopicPartition, Size} = Part}, Backlog} ->
+      %% Limit to one request per topic-partition to maintain order.
+      NewPartitionsOnHold = PartitionsOnHold#{TopicPartition => true},
+      case is_map_key(TopicPartition, PartitionsOnHold) orelse
+           PartKey =/= MergeKey orelse
+           Size > BytesLeft of
+        true ->
+          take_produce_parts(Backlog, MergeKey, NewPartitionsOnHold, BytesLeft, Taken,
+                             queue:in(Part, Rest));
+        false ->
+          take_produce_parts(Backlog, MergeKey, NewPartitionsOnHold, BytesLeft - Size,
+                             [Part | Taken], Rest)
+      end;
+    %% A later part of its partition must not go before it.
+    {{value, {ordered, _, _, TopicPartition} = Entry}, Backlog} ->
+      take_produce_parts(Backlog, MergeKey, PartitionsOnHold#{TopicPartition => true},
+                         BytesLeft, Taken, queue:in(Entry, Rest));
+    {{value, Entry}, Backlog} ->
+      take_produce_parts(Backlog, MergeKey, PartitionsOnHold, BytesLeft, Taken,
+                         queue:in(Entry, Rest))
+  end.
+
+send_produce_parts(Parts, #state{merge_entry_bytes = MergeEntryBytes} = State) ->
+  %% The ref of the request comes from the connection, because a caller can give the
+  %% same ref to more than one request.
+  #kpro_req{ref = Ref} = Request =
+    case Parts of
+      %% A single part does not need a new request.
+      [{merge, _, SingleRequest, _, _, _}] -> SingleRequest#kpro_req{ref = make_ref()};
+      _ -> kpro_req_lib:merge_produce([R || {merge, _, R, _, _, _} <- Parts])
+    end,
+  SentBytes = lists:sum([Size || {merge, _, _, _, _, Size} <- Parts]),
+  State1 = send_request({send, {self(), noreply}, Request},
+                        State#state{merge_entry_bytes = MergeEntryBytes - SentBytes}),
+  lists:foreach(fun({merge, From, _, _, _, _}) -> ok = maybe_reply(From, ok) end, Parts),
+  InFlight = [{PartCaller, PartRef, TopicPartition}
+              || {merge, {PartCaller, _}, #kpro_req{ref = PartRef}, _, TopicPartition, _}
+                   <- Parts],
+  State1#state{produce_in_flight = {Ref, InFlight}}.
+
+deliver_rsp(_Caller, #kpro_rsp{ref = Ref} = Rsp,
+            #state{produce_in_flight = {Ref, InFlight}} = State) ->
+  PartRsps = kpro_rsp_lib:split_produce(Rsp),
+  %% Kafka sends a result for each partition, thus a missing result is not handled.
+  %% maps:get/2 crashes the connection, and the callers send again.
+  lists:foreach(
+    fun({Caller, PartRef, TopicPartition}) ->
+        PartRsp = maps:get(TopicPartition, PartRsps),
+        ok = kafka_reply(Caller, {msg, self(), PartRsp#kpro_rsp{ref = PartRef}})
+    end, InFlight),
+  State#state{produce_in_flight = ?undef};
+deliver_rsp(Caller, Rsp, State) ->
+  ok = kafka_reply(Caller, {msg, self(), Rsp}),
+  State.
 
 sasl_authenticate(#state{client_id = ClientId, mod = Mod, sock = Sock, remote = {Host, _Port}, api_vsns = Versions, config = Config} = State) ->
   Timeout = get_connect_timeout(Config),

@@ -54,6 +54,7 @@ To test with an existing kafka cluster set below environment variables:
 - `KPRO_TEST_KAFKA_ENDPOINTS`: Comma separated endpoints, e.g. `plaintext://localhost:9092,ssl://localhost:9093,sasl_ssl://localhost:9094,sasl_plaintext://localhost:9095`
 - `KPRO_TEST_KAFKA_TOPIC_NAME`: Topic name for message produce/fetch test.
 - `KPRO_TEST_KAFKA_TOPIC_LAT_NAME`: Topic name for message produce/fetch test with `message.timestamp.type=LogAppendTime` set.
+- `KPRO_TEST_KAFKA_TOPIC_MERGE_NAME`: Topic name for the `merge_produce` test. It must have 4 partitions, and two or more of them must have the same leader.
 - `KPRO_TEST_KAFKA_SASL_USER_PASS_FILE`: A text file having two lines for username and password.
 - `KPRO_TEST_SSL_KEY_FILE`: Client private key file
 - `KPRO_TEST_SSL_CERT_FILE`: Client cert file
